@@ -5,6 +5,7 @@ import secrets
 import shutil
 from contextlib import suppress
 from functools import cached_property, wraps
+from glob import has_magic
 from urllib.parse import parse_qs
 
 from fsspec.spec import AbstractFileSystem
@@ -159,14 +160,38 @@ class ArrowFSWrapper(AbstractFileSystem):
 
     @wrap_exceptions
     def rm(self, path, recursive=False, maxdepth=None):
-        path = self._strip_protocol(path).rstrip("/")
-        if self.isdir(path):
-            if recursive:
-                self.fs.delete_dir(path)
-            else:
-                raise ValueError("Can't delete directories without recursive=False")
+        from pyarrow.fs import FileType
+
+        if maxdepth is not None and maxdepth < 1:
+            raise ValueError("maxdepth must be at least 1")
+
+        paths = [path] if isinstance(path, (str, os.PathLike)) else list(path)
+        if not paths:
+            return
+
+        paths = [self._strip_protocol(os.fspath(p)).rstrip("/") for p in paths]
+        if any(not p for p in paths):
+            raise ValueError("Cannot delete the filesystem root")
+
+        # Preserve the abstract rm contract's glob and depth semantics, but
+        # delegate unbounded recursive deletion to Arrow's native backend.
+        if (recursive and maxdepth is not None) or any(has_magic(p) for p in paths):
+            paths = self.expand_path(paths, recursive=recursive, maxdepth=maxdepth)
         else:
-            self.fs.delete_file(path)
+            paths = sorted(set(paths))
+
+        # Arrow supports querying file types for an entire batch in one call.
+        infos = self.fs.get_file_info(paths)
+        for p, info in reversed(list(zip(paths, infos))):
+            if info.type == FileType.Directory:
+                if not recursive:
+                    raise ValueError("Cannot delete directory, set recursive=True")
+                # With a depth limit, keep directories containing deeper files.
+                if maxdepth is not None and self.ls(p):
+                    continue
+                self.fs.delete_dir(p)
+            else:
+                self.fs.delete_file(p)
 
     @wrap_exceptions
     def _open(self, path, mode="rb", block_size=None, seekable=True, **kwargs):
